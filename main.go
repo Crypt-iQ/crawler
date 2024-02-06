@@ -6,10 +6,14 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/wire"
+
+	"github.com/lightningnetwork/lnd/tor"
 )
 
 type serializedKnownAddress struct {
@@ -33,7 +37,7 @@ type serializedAddrManager struct {
 
 func main() {
 	// - load addrs from file
-	filePath := ""
+	filePath := "peers.json"
 
 	_, err := os.Stat(filePath)
 	if os.IsNotExist(err) {
@@ -53,21 +57,78 @@ func main() {
 		return
 	}
 
+	fmt.Printf("done decoding: %d addrs\n", len(sam.Addresses))
+
+	c := &crawler{}
+
+	tor := false
+
 	// todo: ensure no dupes
-	for _, v := range sam.Addresses {
-		// todo: semaphores
-		handshake(v.Addr)
+	if !tor {
+		count := 0
+		for _, v := range sam.Addresses {
+			count++
+			if count == 300 {
+				c.wg.Wait()
+				count = 0
+			}
+			// todo: semaphores
+
+			c.wg.Add(1)
+			go c.handshake(v.Addr, tor)
+
+		}
+	} else {
+		count := 0
+		for _, v := range sam.Addresses {
+			if strings.Contains(v.Addr, "onion") {
+				count++
+				if count == 300 {
+					c.wg.Wait()
+					count = 0
+				}
+				c.wg.Add(1)
+				go c.handshake(v.Addr, tor)
+			}
+		}
 	}
 
 	// theirNA.IP.String() + ":" + strconv.Itoa(int(theirNA.Port))
 	// handshake("65.21.199.219:8333")
 }
 
-func handshake(theirAddr string) {
-	conn, err := net.Dial("tcp", theirAddr)
-	if err != nil {
-		return
+type crawler struct {
+	wg sync.WaitGroup
+}
+
+func (c *crawler) handshake(theirAddr string, torActive bool) {
+	defer c.wg.Done()
+
+	deadline := time.Second * 2
+	if torActive {
+		deadline = time.Second * 4
 	}
+
+	fmt.Printf("dialing:%v\n", theirAddr)
+
+	var conn net.Conn
+	var err error
+	if torActive {
+		conn, err = tor.Dial(
+			theirAddr, "127.0.0.1:9050", false, false, time.Second*5,
+		)
+		if err != nil {
+			return
+		}
+	} else {
+		d := net.Dialer{Timeout: time.Second * 2}
+		conn, err = d.Dial("tcp", theirAddr)
+		if err != nil {
+			return
+		}
+	}
+
+	fmt.Printf("conn to: %v\n", theirAddr)
 
 	ourNA := &wire.NetAddress{
 		Services: wire.SFNodeNetwork | wire.SFNodeWitness,
@@ -93,6 +154,7 @@ func handshake(theirAddr string) {
 	}
 
 	// - wait for version
+	conn.SetReadDeadline(time.Now().Add(deadline))
 	_, msg, _, err := wire.ReadMessageWithEncodingN(
 		conn, 70016, chaincfg.MainNetParams.Net, wire.WitnessEncoding,
 	)
@@ -113,12 +175,19 @@ func handshake(theirAddr string) {
 
 	go func() {
 		select {
-		case <-time.After(time.Second * 2):
+		case <-time.After(deadline):
 			conn.Close()
 		}
 	}()
 
+	fileName := "feefilter.log"
+
+	if torActive {
+		fileName = "feefilter-tor.log"
+	}
+
 	for {
+		conn.SetReadDeadline(time.Now().Add(deadline))
 		_, msg, _, err = wire.ReadMessageWithEncodingN(
 			conn, 70016, chaincfg.MainNetParams.Net, wire.WitnessEncoding,
 		)
@@ -133,7 +202,7 @@ func handshake(theirAddr string) {
 		if filter, ok := msg.(*wire.MsgFeeFilter); ok {
 			// output to file
 			f, err := os.OpenFile(
-				"feefilter.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644,
+				fileName, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644,
 			)
 			if err != nil {
 				panic(fmt.Errorf("open file err: %v", err))
