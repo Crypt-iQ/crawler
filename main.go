@@ -6,14 +6,11 @@ import (
 	"net"
 	"os"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/wire"
-
-	"github.com/lightningnetwork/lnd/tor"
 )
 
 type serializedKnownAddress struct {
@@ -61,71 +58,45 @@ func main() {
 
 	c := &crawler{}
 
-	tor := false
+	dupeMap := make(map[string]struct{})
 
-	// todo: ensure no dupes
-	if !tor {
-		count := 0
-		for _, v := range sam.Addresses {
-			count++
-			if count == 300 {
-				c.wg.Wait()
-				count = 0
-			}
-			// todo: semaphores
-
-			c.wg.Add(1)
-			go c.handshake(v.Addr, tor)
-
+	count := 0
+	for _, v := range sam.Addresses {
+		count++
+		if count == 300 {
+			c.wg.Wait()
+			count = 0
 		}
-	} else {
-		count := 0
-		for _, v := range sam.Addresses {
-			if strings.Contains(v.Addr, "onion") {
-				count++
-				if count == 300 {
-					c.wg.Wait()
-					count = 0
-				}
-				c.wg.Add(1)
-				go c.handshake(v.Addr, tor)
-			}
+
+		if _, ok := dupeMap[v.Addr]; ok {
+			continue
 		}
+
+		dupeMap[v.Addr] = struct{}{}
+
+		c.wg.Add(1)
+		go c.handshake(v.Addr)
+
 	}
-
-	// theirNA.IP.String() + ":" + strconv.Itoa(int(theirNA.Port))
-	// handshake("65.21.199.219:8333")
 }
 
 type crawler struct {
 	wg sync.WaitGroup
 }
 
-func (c *crawler) handshake(theirAddr string, torActive bool) {
+func (c *crawler) handshake(theirAddr string) {
 	defer c.wg.Done()
 
 	deadline := time.Second * 2
-	if torActive {
-		deadline = time.Second * 4
-	}
 
 	fmt.Printf("dialing:%v\n", theirAddr)
 
 	var conn net.Conn
 	var err error
-	if torActive {
-		conn, err = tor.Dial(
-			theirAddr, "127.0.0.1:9050", false, false, time.Second*5,
-		)
-		if err != nil {
-			return
-		}
-	} else {
-		d := net.Dialer{Timeout: time.Second * 2}
-		conn, err = d.Dial("tcp", theirAddr)
-		if err != nil {
-			return
-		}
+	d := net.Dialer{Timeout: time.Second * 2}
+	conn, err = d.Dial("tcp", theirAddr)
+	if err != nil {
+		return
 	}
 
 	fmt.Printf("conn to: %v\n", theirAddr)
@@ -181,10 +152,6 @@ func (c *crawler) handshake(theirAddr string, torActive bool) {
 	}()
 
 	fileName := "feefilter.log"
-
-	if torActive {
-		fileName = "feefilter-tor.log"
-	}
 
 	for {
 		conn.SetReadDeadline(time.Now().Add(deadline))
